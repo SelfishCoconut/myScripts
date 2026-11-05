@@ -11,7 +11,10 @@ The phone's camera is streamed into a virtual `/dev/video*` device that any app
 - Connects over USB if the phone is plugged in.
 - Otherwise reconnects to a remembered wireless-debugging device, or pairs a
   new one — auto-discovering it over mDNS where possible.
-- Remembers up to 10 wireless devices and the last camera id used on each.
+- Remembers up to 10 wireless devices and the last camera id used on each,
+  pinned to the device's `ro.serialno` so a reused/spoofed address on the
+  same network isn't silently trusted as a different, previously-paired
+  phone.
 - Remembers a rotation per camera id, so front/back cameras come out right
   side up without having to pass `--rotate` every time.
 - Headless by default (no scrcpy preview window); `--window` shows one.

@@ -64,12 +64,16 @@ list_known_devices() {
     return
   fi
   log "Remembered devices (most recently used first):"
-  local addr cid epoch when
-  while IFS='|' read -r addr cid epoch; do
+  local addr cid epoch serial when
+  while IFS='|' read -r addr cid epoch serial; do
     [ -z "$addr" ] && continue
     when="$(date -d "@$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || echo unknown)"
-    printf '  %-22s camera %-3s last used %s\n' "$addr" "${cid:-?}" "$when"
+    printf '  %-22s camera %-3s last used %s%s\n' "$addr" "${cid:-?}" "$when" "${serial:+ (serial $serial)}"
   done < "$DEVICES_FILE"
+}
+
+get_serial() {
+  adb -s "$1" shell getprop ro.serialno 2>/dev/null | tr -d '\r\n'
 }
 
 if [ -n "${LIST_DEVICES:-}" ]; then
@@ -80,9 +84,11 @@ fi
 remember_device() {
   local addr="$1" cid="$2"
   [ -z "$addr" ] && return
+  local serial
+  serial="$(get_serial "$addr")"
   local tmp="$DEVICES_FILE.tmp"
   {
-    printf '%s|%s|%s\n' "$addr" "$cid" "$(date +%s)"
+    printf '%s|%s|%s|%s\n' "$addr" "$cid" "$(date +%s)" "$serial"
     [ -f "$DEVICES_FILE" ] && grep -vF "$addr|" "$DEVICES_FILE"
   } 2>/dev/null | head -n "$MAX_REMEMBERED" > "$tmp"
   mv "$tmp" "$DEVICES_FILE"
@@ -113,11 +119,19 @@ set_cam_rotation() {
 
 try_known_devices() {
   [ -f "$DEVICES_FILE" ] || return 1
-  local addr cid epoch
-  while IFS='|' read -r addr cid epoch; do
+  local addr cid epoch serial actual
+  while IFS='|' read -r addr cid epoch serial; do
     [ -z "$addr" ] && continue
     log "Trying known device: $addr"
     if adb connect "$addr" >/dev/null 2>&1 && device_connected; then
+      if [ -n "$serial" ]; then
+        actual="$(get_serial "$addr")"
+        if [ -n "$actual" ] && [ "$actual" != "$serial" ]; then
+          err "Serial mismatch at $addr (expected $serial, got $actual) -- refusing to trust this address. Run with --new to pair it as a different device."
+          adb disconnect "$addr" >/dev/null 2>&1
+          continue
+        fi
+      fi
       CONNECTED_ADDR="$addr"
       [ -z "$CAMERA_ID" ] && CAMERA_ID="$cid"
       return 0
