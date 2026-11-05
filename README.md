@@ -74,4 +74,4 @@ them.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Beerware — see [LICENSE](LICENSE).
