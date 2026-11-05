@@ -86,6 +86,9 @@ remember_device() {
   [ -z "$addr" ] && return
   local serial
   serial="$(get_serial "$addr")"
+  if [ -z "$serial" ] && [ -f "$DEVICES_FILE" ]; then
+    serial="$(awk -F'|' -v a="$addr" '$1==a{print $4; exit}' "$DEVICES_FILE")"
+  fi
   local tmp="$DEVICES_FILE.tmp"
   {
     printf '%s|%s|%s|%s\n' "$addr" "$cid" "$(date +%s)" "$serial"
@@ -126,8 +129,8 @@ try_known_devices() {
     if adb connect "$addr" >/dev/null 2>&1 && device_connected; then
       if [ -n "$serial" ]; then
         actual="$(get_serial "$addr")"
-        if [ -n "$actual" ] && [ "$actual" != "$serial" ]; then
-          err "Serial mismatch at $addr (expected $serial, got $actual) -- refusing to trust this address. Run with --new to pair it as a different device."
+        if [ -z "$actual" ] || [ "$actual" != "$serial" ]; then
+          err "Serial mismatch at $addr (expected $serial, got ${actual:-<none>}) -- refusing to trust this address. Run with --new to pair it as a different device."
           adb disconnect "$addr" >/dev/null 2>&1
           continue
         fi
