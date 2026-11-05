@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# Turn the Android phone into a Linux webcam (v4l2loopback + scrcpy).
+# Connects over USB if plugged in, otherwise reconnects a remembered
+# wireless device or pairs a new one (auto-discovered via mDNS where possible).
+set -uo pipefail
+
+VIDEO_NR="${PHONECAM_VIDEO_NR:-10}"
+VIDEO_DEV="/dev/video${VIDEO_NR}"
+CARD_LABEL="Android Camera"
+CAMERA_SIZE="${PHONECAM_SIZE:-1280x720}"
+CAMERA_FPS="${PHONECAM_FPS:-30}"
+CAPTURE_ORIENTATION="${PHONECAM_ROTATE:-270}"
+MAX_REMEMBERED=10
+
+CONF_DIR="$HOME/.config/phonecam"
+DEVICES_FILE="$CONF_DIR/devices"
+ROTATIONS_FILE="$CONF_DIR/camera_rotations"
+mkdir -p "$CONF_DIR"
+
+CAMERA_ID=""
+CONNECTED_ADDR=""
+ROTATE_EXPLICIT=""
+
+log()  { printf '\033[1;34m[phonecam]\033[0m %s\n' "$*"; }
+err()  { printf '\033[1;31m[phonecam]\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat <<EOF
+Usage: phonecam [--camera-id=N] [--window] [--new] [--list-devices] [--reset] [--list-cameras] [-h]
+
+  --camera-id=N    Use this camera id instead of the saved/prompted one.
+  --rotate=N       Clockwise capture rotation: 0, 90, 180 or 270 (default: 270).
+  --window         Show the scrcpy preview window (default: headless).
+  --new            Set up a new device: skip remembered addresses and
+                    pair/connect fresh. The result is remembered afterwards.
+  --list-devices   Show remembered wireless devices and exit.
+  --reset          Forget all remembered devices and camera ids.
+  --list-cameras   Just list the phone's cameras (device must be connected) and exit.
+  -h, --help       Show this help.
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --camera-id=*) CAMERA_ID="${arg#*=}" ;;
+    --rotate=*) CAPTURE_ORIENTATION="${arg#*=}"; ROTATE_EXPLICIT=1 ;;
+    --window) SHOW_WINDOW=1 ;;
+    --new) NEW_CONNECTION=1 ;;
+    --list-devices) LIST_DEVICES=1 ;;
+    --reset)
+      rm -f "$DEVICES_FILE" "$ROTATIONS_FILE"
+      log "Forgot all remembered devices and camera rotations."
+      exit 0
+      ;;
+    --list-cameras) LIST_ONLY=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) err "Unknown option: $arg"; usage; exit 1 ;;
+  esac
+done
+
+list_known_devices() {
+  if [ ! -s "$DEVICES_FILE" ]; then
+    log "No remembered devices yet."
+    return
+  fi
+  log "Remembered devices (most recently used first):"
+  local addr cid epoch when
+  while IFS='|' read -r addr cid epoch; do
+    [ -z "$addr" ] && continue
+    when="$(date -d "@$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || echo unknown)"
+    printf '  %-22s camera %-3s last used %s\n' "$addr" "${cid:-?}" "$when"
+  done < "$DEVICES_FILE"
+}
+
+if [ -n "${LIST_DEVICES:-}" ]; then
+  list_known_devices
+  exit 0
+fi
+
+remember_device() {
+  local addr="$1" cid="$2"
+  [ -z "$addr" ] && return
+  local tmp="$DEVICES_FILE.tmp"
+  {
+    printf '%s|%s|%s\n' "$addr" "$cid" "$(date +%s)"
+    [ -f "$DEVICES_FILE" ] && grep -vF "$addr|" "$DEVICES_FILE"
+  } 2>/dev/null | head -n "$MAX_REMEMBERED" > "$tmp"
+  mv "$tmp" "$DEVICES_FILE"
+}
+
+get_cam_rotation() {
+  local id="$1"
+  [ -f "$ROTATIONS_FILE" ] || return 1
+  local line_id rot
+  while IFS='|' read -r line_id rot; do
+    if [ "$line_id" = "$id" ]; then
+      echo "$rot"
+      return 0
+    fi
+  done < "$ROTATIONS_FILE"
+  return 1
+}
+
+set_cam_rotation() {
+  local id="$1" rot="$2"
+  local tmp="$ROTATIONS_FILE.tmp"
+  {
+    printf '%s|%s\n' "$id" "$rot"
+    [ -f "$ROTATIONS_FILE" ] && grep -vF "$id|" "$ROTATIONS_FILE"
+  } 2>/dev/null > "$tmp"
+  mv "$tmp" "$ROTATIONS_FILE"
+}
+
+try_known_devices() {
+  [ -f "$DEVICES_FILE" ] || return 1
+  local addr cid epoch
+  while IFS='|' read -r addr cid epoch; do
+    [ -z "$addr" ] && continue
+    log "Trying known device: $addr"
+    if adb connect "$addr" >/dev/null 2>&1 && device_connected; then
+      CONNECTED_ADDR="$addr"
+      [ -z "$CAMERA_ID" ] && CAMERA_ID="$cid"
+      return 0
+    fi
+  done < "$DEVICES_FILE"
+  return 1
+}
+
+ensure_v4l2loopback() {
+  if [ -e "$VIDEO_DEV" ]; then
+    log "Virtual webcam already present at $VIDEO_DEV"
+    return
+  fi
+  log "Loading v4l2loopback -> $VIDEO_DEV"
+  sudo modprobe v4l2loopback video_nr="$VIDEO_NR" card_label="$CARD_LABEL" exclusive_caps=1
+  for _ in $(seq 1 25); do
+    [ -e "$VIDEO_DEV" ] && break
+    sleep 0.2
+  done
+  if [ ! -e "$VIDEO_DEV" ]; then
+    err "Failed to create $VIDEO_DEV"
+    exit 1
+  fi
+}
+
+device_state() {
+  adb devices | awk 'NR>1 && NF>=2 {print $2; exit}'
+}
+
+device_connected() { [ "$(device_state)" = "device" ]; }
+
+find_mdns_addr() {
+  adb mdns services 2>/dev/null | grep -F "$1" | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]+' | head -n1
+}
+
+pair_device() {
+  local state
+  state="$(device_state)"
+
+  if [ "$state" = "unauthorized" ]; then
+    log "Phone plugged in but USB debugging not authorized yet."
+    echo "Accept the 'Allow USB debugging' prompt on the phone screen."
+    adb wait-for-device
+    if device_connected; then
+      log "USB device authorized and connected."
+      return
+    fi
+  fi
+
+  log "No ADB device connected via USB."
+
+  if [ -n "${NEW_CONNECTION:-}" ]; then
+    log "New connection requested (--new): skipping remembered devices."
+  else
+    if try_known_devices; then
+      log "Reconnected to $CONNECTED_ADDR"
+      return
+    fi
+
+    log "Looking for the phone on the network (mDNS)..."
+    local connect_addr
+    connect_addr="$(find_mdns_addr '_adb-tls-connect._tcp')"
+    if [ -n "$connect_addr" ]; then
+      log "Found wireless debugging at $connect_addr"
+      if adb connect "$connect_addr" >/dev/null 2>&1 && device_connected; then
+        CONNECTED_ADDR="$connect_addr"
+        return
+      fi
+    fi
+  fi
+
+  local pair_addr pair_code connect_addr
+  pair_addr="$(find_mdns_addr '_adb-tls-pairing._tcp')"
+  if [ -z "$pair_addr" ]; then
+    echo
+    echo "On the phone: Settings > Developer options > Wireless debugging >"
+    echo "'Pair device with pairing code'."
+    read -r -p "Press Enter once that screen is showing a code... " _
+    pair_addr="$(find_mdns_addr '_adb-tls-pairing._tcp')"
+  fi
+
+  if [ -n "$pair_addr" ]; then
+    log "Found pairing service at $pair_addr"
+  else
+    read -r -p "Couldn't auto-detect it. Enter the pairing IP:port shown on screen: " pair_addr
+  fi
+
+  read -r -p "Enter the 6-digit pairing code shown on screen: " pair_code
+  if ! adb pair "$pair_addr" "$pair_code"; then
+    err "Pairing failed."
+    exit 1
+  fi
+
+  connect_addr="$(find_mdns_addr '_adb-tls-connect._tcp')"
+  if [ -z "$connect_addr" ]; then
+    read -r -p "Enter the device IP:port shown at the top of the Wireless debugging screen: " connect_addr
+  fi
+  adb connect "$connect_addr"
+
+  if ! device_connected; then
+    err "Could not connect to device."
+    exit 1
+  fi
+  CONNECTED_ADDR="$connect_addr"
+}
+
+pick_camera() {
+  if [ -n "${LIST_ONLY:-}" ]; then
+    scrcpy --list-cameras
+    exit 0
+  fi
+  if [ -z "$CAMERA_ID" ]; then
+    echo
+    log "Available cameras:"
+    scrcpy --list-cameras
+    read -r -p "Camera id to use [0]: " cam_id
+    CAMERA_ID="${cam_id:-0}"
+  fi
+}
+
+main() {
+  ensure_v4l2loopback
+  if [ -z "${NEW_CONNECTION:-}" ] && device_connected; then
+    log "ADB device already connected ($(adb devices | awk 'NR==2{print $1}'))."
+  else
+    pair_device
+  fi
+  pick_camera
+  remember_device "$CONNECTED_ADDR" "$CAMERA_ID"
+
+  if [ -n "$ROTATE_EXPLICIT" ]; then
+    set_cam_rotation "$CAMERA_ID" "$CAPTURE_ORIENTATION"
+  else
+    local saved_rot
+    if saved_rot="$(get_cam_rotation "$CAMERA_ID")"; then
+      CAPTURE_ORIENTATION="$saved_rot"
+    fi
+  fi
+
+  log "Starting scrcpy camera stream -> $VIDEO_DEV (camera $CAMERA_ID, rotate $CAPTURE_ORIENTATION, ${CAMERA_SIZE}@${CAMERA_FPS}fps)"
+  local window_args=(--no-window --no-playback)
+  [ -n "${SHOW_WINDOW:-}" ] && window_args=()
+  exec scrcpy \
+    --video-source=camera \
+    --camera-id="$CAMERA_ID" \
+    --camera-size="$CAMERA_SIZE" \
+    --camera-fps="$CAMERA_FPS" \
+    --capture-orientation="$CAPTURE_ORIENTATION" \
+    --v4l2-sink="$VIDEO_DEV" \
+    "${window_args[@]}"
+}
+
+main
