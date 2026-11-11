@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# gsearch — search a git repo for a string everywhere:
+#   1. the working tree (incl. untracked files) — text, PDFs, Office/ODF docs, archives…
+#   2. every text file in every commit of every branch/tag/stash
+#   3. every PDF/doc/archive that ever existed in any commit
+#
+# Deps (Arch): sudo pacman -S --needed git ripgrep-all poppler pandoc-cli
+#   optional:  ffmpeg (media subtitles/metadata), sqlite (for .db files)
+set -uo pipefail
+
+usage() {
+  cat <<EOF
+Usage: gsearch [options] PATTERN
+
+  -i        case-insensitive
+  -r        PATTERN is a regex (default: literal string)
+  -x        also search the reflog (amended / rebased / dropped commits)
+  -t        working tree only (skip history)
+  -H        history only (skip working tree)
+  -C DIR    repo to search (default: current directory)
+  -h        help
+EOF
+  exit "${1:-1}"
+}
+
+ci=(); fixed=(-F); revopts=(--all); dir=.; do_tree=1; do_hist=1
+while getopts "irxtHC:h" o; do
+  case $o in
+    i) ci=(-i) ;;
+    r) fixed=() ;;
+    x) revopts+=(--reflog) ;;
+    t) do_hist=0 ;;
+    H) do_tree=0 ;;
+    C) dir=$OPTARG ;;
+    h) usage 0 ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -eq 1 ]] || usage
+pat=$1
+
+cd "$dir" || exit 1
+git rev-parse --git-dir >/dev/null 2>&1 || { echo "gsearch: not a git repo: $dir" >&2; exit 1; }
+command -v rga >/dev/null || {
+  echo "gsearch: needs ripgrep-all → sudo pacman -S --needed ripgrep-all poppler pandoc-cli" >&2; exit 1; }
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+if [[ -t 1 ]]; then B=$'\e[1;34m'; Y=$'\e[33m'; D=$'\e[2m'; R=$'\e[0m'; else B= Y= D= R=; fi
+hdr() { printf '\n%s== %s ==%s\n' "$B" "$*" "$R"; }
+
+# Extensions pulled out of history and handed to rga (text files are covered by git grep).
+exts='pdf|docx|doc|odt|ods|odp|pptx|xlsx|rtf|epub|fb2|ipynb|zip|jar|tar|tgz|tbz2|txz|gz|bz2|xz|zst|7z|sqlite|sqlite3|db|db3|eml|mbox|mkv|mp4|webm'
+
+# ── 1. Working tree ───────────────────────────────────────────────────────────
+if (( do_tree )); then
+  hdr "Working tree (text + PDFs/docs/archives, incl. untracked)"
+  rga "${ci[@]}" "${fixed[@]}" --hidden --glob '!.git' -n -- "$pat" . || echo "(no matches)"
+fi
+
+(( do_hist )) || exit 0
+
+# ── 2. Text files across every commit ────────────────────────────────────────
+hdr "History: text files in every commit"
+git rev-list "${revopts[@]}" |
+  xargs -r git grep -I -n "${ci[@]}" "${fixed[@]}" -e "$pat" 2>/dev/null |
+  awk -F: -v Y="$Y" -v D="$D" -v R="$R" '
+    {
+      sha = $1; path = $2; ln = $3
+      text = $0; sub(/^[^:]*:[^:]*:[^:]*:/, "", text)
+      if (length(text) > 200) text = substr(text, 1, 200) "…"
+      key = path SUBSEP text
+      if (!(key in n)) { order[++k] = key; newest[key] = sha; p[key] = path; t[key] = text; l[key] = ln }
+      n[key]++; oldest[key] = sha          # rev-list is newest-first, so the last seen is the oldest
+    }
+    END {
+      for (i = 1; i <= k; i++) {
+        key = order[i]
+        printf "%s%s:%s%s: %s\n", Y, p[key], l[key], R, t[key]
+        printf "    %s↳ in %d commit(s) · first appears %s · latest %s%s\n", D, n[key], substr(oldest[key],1,10), substr(newest[key],1,10), R
+      }
+      if (k == 0) print "(no matches)"
+    }'
+
+# ── 3. PDFs / docs / archives across every commit ────────────────────────────
+hdr "History: PDFs, docs & archives in every commit"
+tmp=$(mktemp -d -t gsearch.XXXXXX)
+trap 'rm -rf "$tmp"' EXIT
+declare -A blobpath
+
+# Every unique blob reachable from any commit, with a path it lived at.
+while read -r hash path; do
+  [[ -n ${path:-} ]] || continue
+  [[ ${path,,} =~ \.($exts)$ ]] || continue
+  [[ -n ${blobpath[$hash]:-} ]] && continue
+  blobpath[$hash]=$path
+  mkdir -p "$tmp/$hash"
+  git cat-file blob "$hash" > "$tmp/$hash/${path##*/}"
+done < <(git rev-list "${revopts[@]}" --objects --filter=object:type=blob 2>/dev/null)
+
+if (( ${#blobpath[@]} == 0 )); then
+  echo "(no PDFs/docs/archives anywhere in history)"
+  exit 0
+fi
+
+mapfile -t hits < <(rga -l "${ci[@]}" "${fixed[@]}" -- "$pat" "$tmp" 2>/dev/null)
+(( ${#hits[@]} )) || { echo "(no matches in ${#blobpath[@]} historical document versions)"; exit 0; }
+
+for f in "${hits[@]}"; do
+  hash=${f#"$tmp"/}; hash=${hash%%/*}
+  printf '%s%s%s  %s(blob %s)%s\n' "$Y" "${blobpath[$hash]}" "$R" "$D" "${hash:0:10}" "$R"
+  { rga -n --no-filename --color=never "${ci[@]}" "${fixed[@]}" -- "$pat" "$f" 2>/dev/null || true; } |
+    head -n 10 | cut -c1-200 | sed 's/^/    /'
+  printf '    %sadded/removed in:%s\n' "$D" "$R"
+  git log "${revopts[@]}" --date=short --format='      %h %ad %an  %s' --find-object="$hash" | head -n 10
+done

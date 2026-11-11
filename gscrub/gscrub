@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# gscrub — remove a string from a git repo's ENTIRE history.
+#   • text files, every commit:       PATTERN → your replacement text
+#   • commit messages:                PATTERN → your replacement text
+#   • PDFs / docs / archives:         every version containing PATTERN is deleted
+#                                     (their contents can't be edited in place)
+# A full backup bundle is written before anything is rewritten.
+#
+# Deps (Arch): sudo pacman -S --needed git git-filter-repo ripgrep-all poppler pandoc-cli
+set -uo pipefail
+
+usage() {
+  cat <<EOF
+Usage: gscrub [options] PATTERN [REPLACEMENT]
+
+  REPLACEMENT   text written in place of PATTERN (asked for if omitted)
+  -i            case-insensitive
+  -r            PATTERN is a regex (Python syntax; \1 etc. allowed in REPLACEMENT)
+  -C DIR        repo (default: current directory)
+  -y            don't ask for confirmation
+  -h            help
+EOF
+  exit "${1:-1}"
+}
+
+icase=0; regex=0; dir=.; yes=0
+while getopts "irC:yh" o; do
+  case $o in
+    i) icase=1 ;; r) regex=1 ;; C) dir=$OPTARG ;; y) yes=1 ;; h) usage 0 ;; *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -ge 1 && $# -le 2 ]] || usage
+pat=$1
+if [[ $# -eq 2 ]]; then
+  repl=$2
+else
+  read -r -p "Replace \"$pat\" with: " repl
+fi
+[[ $repl == *'==>'* || $pat == *'==>'* ]] && { echo "gscrub: '==>' can't appear in pattern or replacement" >&2; exit 1; }
+[[ $pat == *$'\n'* || $repl == *$'\n'* ]] && { echo "gscrub: newlines not supported" >&2; exit 1; }
+
+die() { echo "gscrub: $*" >&2; exit 1; }
+cd "$dir" || exit 1
+git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repo: $dir"
+command -v git-filter-repo >/dev/null || die "needs git-filter-repo → sudo pacman -S git-filter-repo"
+command -v rga >/dev/null || die "needs ripgrep-all → sudo pacman -S --needed ripgrep-all poppler pandoc-cli"
+top=$(git rev-parse --show-toplevel); cd "$top" || exit 1
+[[ -z $(git status --porcelain --untracked-files=no) ]] || die "you have uncommitted changes — commit or stash them first"
+
+if [[ -t 1 ]]; then B=$'\e[1;34m'; Y=$'\e[33m'; RD=$'\e[1;31m'; D=$'\e[2m'; R=$'\e[0m'; else B= Y= RD= D= R=; fi
+hdr() { printf '\n%s== %s ==%s\n' "$B" "$*" "$R"; }
+
+# search flags for git grep / rga
+gflags=(); rflags=()
+(( icase )) && { gflags+=(-i); rflags+=(-i); }
+if (( regex )); then gflags+=(-P); else gflags+=(-F); rflags+=(-F); fi
+
+exts='pdf|docx|doc|odt|ods|odp|pptx|xlsx|rtf|epub|fb2|ipynb|zip|jar|tar|tgz|tbz2|txz|gz|bz2|xz|zst|7z|sqlite|sqlite3|db|db3|eml|mbox|mkv|mp4|webm'
+tmp=$(mktemp -d -t gscrub.XXXXXX); trap 'rm -rf "$tmp"' EXIT
+
+# ── Find document versions that contain PATTERN ──────────────────────────────
+find_doc_hits() {  # prints "blobhash<TAB>path" for each matching document version
+  local d=$tmp/blobs; rm -rf "$d"; mkdir -p "$d"
+  declare -A seen
+  while read -r hash path; do
+    [[ -n ${path:-} && ${path,,} =~ \.($exts)$ ]] || continue
+    [[ -n ${seen[$hash]:-} ]] && continue
+    seen[$hash]=$path
+    mkdir -p "$d/$hash"; git cat-file blob "$hash" > "$d/$hash/${path##*/}"
+  done < <(git rev-list --all --objects --filter=object:type=blob 2>/dev/null)
+  (( ${#seen[@]} )) || return 0
+  rga -l "${rflags[@]}" -- "$pat" "$d" 2>/dev/null | while IFS= read -r f; do
+    h=${f#"$d"/}; h=${h%%/*}; printf '%s\t%s\n' "$h" "${seen[$h]}"
+  done
+}
+count_text_hits() {
+  git rev-list --all | xargs -r git grep -I -h "${gflags[@]}" -e "$pat" 2>/dev/null | sort -u | wc -l
+}
+count_msg_hits() {
+  local f=(--all --format=%H); (( icase )) && f+=(-i); (( regex )) && f+=(-P) || f+=(-F)
+  git log "${f[@]}" --grep="$pat" 2>/dev/null | wc -l
+}
+
+# ── Plan ─────────────────────────────────────────────────────────────────────
+hdr "Scanning history"
+mapfile -t doc_hits < <(find_doc_hits)
+text_n=$(count_text_hits)
+msg_n=$(count_msg_hits)
+
+printf '  %d distinct text line(s) will have "%s" → "%s"\n' "$text_n" "$pat" "$repl"
+printf '  %d commit message(s) will be edited the same way\n' "$msg_n"
+printf '  %d document version(s) will be %sDELETED from history%s:\n' "${#doc_hits[@]}" "$RD" "$R"
+declare -A in_head=()
+while IFS= read -r p; do in_head[$p]=1; done < <(git ls-tree -r --format='%(objectname)' HEAD 2>/dev/null)
+for l in "${doc_hits[@]}"; do
+  h=${l%%$'\t'*}; p=${l#*$'\t'}
+  note=; [[ -n ${in_head[$h]:-} ]] && note=" ${RD}← in your current files, will disappear from them too${R}"
+  printf '    %s%s%s %s(blob %s)%s%s\n' "$Y" "$p" "$R" "$D" "${h:0:10}" "$R" "$note"
+done
+
+(( text_n + msg_n + ${#doc_hits[@]} )) || { echo; echo "Nothing to scrub."; exit 0; }
+
+origin=$(git remote get-url origin 2>/dev/null || true)
+backup="$(dirname "$top")/$(basename "$top")-backup-$(date +%Y%m%d-%H%M%S).bundle"
+echo
+echo "  This rewrites EVERY commit hash. A backup of everything goes to:"
+echo "    $backup"
+if (( ! yes )); then
+  read -r -p "Type 'scrub' to continue: " ans
+  [[ $ans == scrub ]] || { echo "Aborted, nothing changed."; exit 1; }
+fi
+
+# ── Backup ───────────────────────────────────────────────────────────────────
+hdr "Backing up"
+git bundle create "$backup" --all >/dev/null 2>&1 || die "backup failed — nothing changed"
+git bundle verify "$backup" >/dev/null 2>&1 || die "backup didn't verify — nothing changed"
+echo "  $backup"
+
+# ── Rewrite ──────────────────────────────────────────────────────────────────
+hdr "Rewriting history"
+if (( regex )); then expr=$pat; else expr=$(python3 -c 'import re,sys;print(re.escape(sys.argv[1]))' "$pat"); fi
+(( icase )) && expr="(?i)$expr"
+printf 'regex:%s==>%s\n' "$expr" "$repl" > "$tmp/expr.txt"
+
+fr=(git filter-repo --force --replace-text "$tmp/expr.txt" --replace-message "$tmp/expr.txt")
+if (( ${#doc_hits[@]} )); then
+  printf '%s\n' "${doc_hits[@]%%$'\t'*}" > "$tmp/blobs.txt"
+  fr+=(--strip-blobs-with-ids "$tmp/blobs.txt")
+fi
+"${fr[@]}" || die "git filter-repo failed — restore with: git clone $backup"
+
+# ── Verify ───────────────────────────────────────────────────────────────────
+hdr "Verifying"
+left_text=$(count_text_hits); left_msg=$(count_msg_hits); mapfile -t left_docs < <(find_doc_hits)
+if (( left_text + left_msg + ${#left_docs[@]} )); then
+  printf '  %s⚠ still found: %d text line(s), %d message(s), %d document(s) — check with gsearch%s\n' \
+    "$RD" "$left_text" "$left_msg" "${#left_docs[@]}" "$R"
+else
+  echo "  ✔ \"$pat\" no longer appears anywhere in history"
+fi
+[[ -n $(git ls-files --others --exclude-standard 2>/dev/null) ]] &&
+  echo "  Note: untracked files weren't touched — run 'gsearch -t \"$pat\"' to check them."
+
+# ── Next steps ───────────────────────────────────────────────────────────────
+hdr "Next steps (not done for you)"
+[[ -n $origin ]] && echo "  git remote add origin $origin      # filter-repo removes it as a safety measure"
+cat <<EOF
+  git push --force --all && git push --force --tags
+  • If this was a password/key/token: rotate it now. Anyone who cloned or forked
+    before this, and any CI logs/caches, still have the old history.
+  • Collaborators must re-clone (or hard-reset); a normal pull will bring it back.
+  • GitHub/GitLab can keep old commits reachable via PRs and caches — contact their
+    support to purge them if it matters.
+  • Backup: $backup  (delete it once you're sure — it contains the string)
+EOF

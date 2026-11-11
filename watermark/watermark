@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import sys
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+
+def create_watermark(image, text, opacity, angle, font_size, spacing, color, font_path):
+
+    width, height = image.size
+
+    # Load font (built-in fallback, no external font dependency)
+    if font_path:
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except OSError:
+            print("Warning: Custom font unavailable. Using built-in font.")
+            font = ImageFont.load_default(size=font_size)
+    else:
+        font = ImageFont.load_default(size=font_size)
+
+    # Calculate text dimensions
+    bbox = font.getbbox(text)
+    text_width = max(1, int(font.getlength(text)))
+    text_height = max(1, bbox[3] - bbox[1])
+
+    # Create a repeating watermark tile
+    step_x = max(1, text_width + spacing)
+    step_y = max(1, text_height + spacing)
+
+    tile = Image.new(
+        "RGBA",
+        (step_x, step_y),
+        (0, 0, 0, 0)
+    )
+
+    draw = ImageDraw.Draw(tile)
+
+    draw.text(
+        (0, 0),
+        text,
+        font=font,
+        fill=(*color, opacity)
+    )
+
+    # Create a pattern large enough to cover the image after rotation
+    diagonal = int((width ** 2 + height ** 2) ** 0.5)
+
+    pattern = Image.new(
+        "RGBA",
+        (diagonal * 2, diagonal * 2),
+        (0, 0, 0, 0)
+    )
+
+    for y in range(0, pattern.height, step_y):
+        for x in range(0, pattern.width, step_x):
+            pattern.alpha_composite(tile, (x, y))
+
+    # Rotate the pattern
+    pattern = pattern.rotate(
+        angle,
+        resample=Image.Resampling.BICUBIC,
+        expand=False
+    )
+
+    # Crop the center to the original image dimensions
+    cx = pattern.width // 2
+    cy = pattern.height // 2
+
+    pattern = pattern.crop((
+        cx - width // 2,
+        cy - height // 2,
+        cx - width // 2 + width,
+        cy - height // 2 + height
+    ))
+
+    # Composite watermark over original
+    base = image.convert("RGBA")
+    result = Image.alpha_composite(base, pattern)
+
+    return result
+
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Add repeated diagonal text watermark to an image."
+    )
+
+    parser.add_argument("input", help="Input image")
+    parser.add_argument("output", help="Output image")
+    parser.add_argument("text", help="Watermark text")
+
+    parser.add_argument(
+        "--opacity",
+        type=int,
+        default=75,
+        help="Opacity from 0 to 255 (default: 75)"
+    )
+
+    parser.add_argument(
+        "--angle",
+        type=float,
+        default=35,
+        help="Rotation angle (default: 35)"
+    )
+
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=38,
+        help="Font size (default: 38)"
+    )
+
+    parser.add_argument(
+        "--spacing",
+        type=int,
+        default=100,
+        help="Spacing between repetitions (default: 100)"
+    )
+
+    parser.add_argument(
+        "--color",
+        default="80,80,80",
+        help="RGB color (default: 80,80,80)"
+    )
+
+    parser.add_argument(
+        "--font",
+        default=None,
+        help="Optional custom font file"
+    )
+
+    args = parser.parse_args()
+
+    if not 0 <= args.opacity <= 255:
+        parser.error("Opacity must be between 0 and 255.")
+
+    if args.size <= 0 or args.spacing < 0:
+        parser.error("Font size must be positive and spacing non-negative.")
+
+    try:
+        color = tuple(int(c) for c in args.color.split(","))
+
+        if len(color) != 3 or any(c < 0 or c > 255 for c in color):
+            raise ValueError()
+
+    except ValueError:
+        parser.error("Color must contain three RGB values (0-255).")
+
+    if not args.text.strip():
+        parser.error("Watermark text cannot be empty.")
+
+    try:
+        with Image.open(args.input) as source:
+
+            image = ImageOps.exif_transpose(source)
+            image.load()
+
+            result = create_watermark(
+                image,
+                args.text,
+                args.opacity,
+                args.angle,
+                args.size,
+                args.spacing,
+                color,
+                args.font
+            )
+
+            extension = os.path.splitext(args.output)[1].lower()
+
+            if extension in (".jpg", ".jpeg"):
+                result.convert("RGB").save(
+                    args.output,
+                    quality=95,
+                    optimize=True
+                )
+
+            elif extension == ".png":
+                result.save(args.output, optimize=True)
+
+            elif extension == ".webp":
+                result.save(args.output, quality=95)
+
+            else:
+                parser.error("Supported formats: JPG, PNG, WEBP")
+
+        print(f"Watermarked image saved: {args.output}")
+
+    except FileNotFoundError:
+        print(f"Error: File not found: {args.input}")
+        sys.exit(1)
+
+    except OSError as error:
+        print(f"Image error: {error}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
